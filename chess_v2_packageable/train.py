@@ -1,11 +1,24 @@
+import random
 import torch
 import chess
+import numpy as np
 from chess_game import ChessGame
 from mcts import MCTS, move_to_index
 from network import ChessNet, board_to_tensor, OUTPUT_DIM, device
+from play_v3 import print_board_with_coords
+
+TEMPERATURE_MOVES = 15  # use temperature sampling for the first N moves of each game
 
 
-def self_play_game(net, num_simulations=100, max_moves=140):
+def _select_move_with_temperature(visit_counts):
+    """Sample a move proportionally to visit counts (exploration)."""
+    moves  = list(visit_counts.keys())
+    counts = np.array([visit_counts[m] for m in moves], dtype=np.float64)
+    probs  = counts / counts.sum()
+    return moves[np.random.choice(len(moves), p=probs)]
+
+
+def self_play_game(net, num_simulations=100, max_moves=100):
     """
     Runs a single self-play game using MCTS for move selection.
     States and player labels are recorded BEFORE each move so they correspond
@@ -18,11 +31,11 @@ def self_play_game(net, num_simulations=100, max_moves=140):
     move_count = 0
 
     while not game.is_terminal():
-        if move_count >= max_moves or game.board.can_claim_draw():
-            print("\nGame ended due to move limit or draw rule.")
+        if move_count >= max_moves:
+            print("Game ended: move limit reached.")
             break
 
-        root        = mcts.search(game)
+        root        = mcts.search(game, add_noise=True)
         valid_moves = game.get_valid_moves()
         visit_counts = {
             move: root.children[move].visit_count if move in root.children else 0
@@ -33,7 +46,25 @@ def self_play_game(net, num_simulations=100, max_moves=140):
             print("No valid moves left. Game over.")
             break
 
-        best_move = max(visit_counts, key=visit_counts.get)
+        # Filter out moves that would immediately allow a draw claim, unless
+        # every legal move does so (forced draw).
+        non_draw_moves = {}
+        for move, count in visit_counts.items():
+            test_game = game.clone()
+            test_game.make_move(move)
+            if not test_game.board.can_claim_draw():
+                non_draw_moves[move] = count
+        if non_draw_moves:
+            visit_counts = non_draw_moves
+        else:
+            print("Game ended: draw unavoidable.")
+            break
+
+        # Temperature sampling for early moves, greedy afterwards.
+        if move_count < TEMPERATURE_MOVES:
+            best_move = _select_move_with_temperature(visit_counts)
+        else:
+            best_move = max(visit_counts, key=visit_counts.get)
 
         # Record state and active player BEFORE making the move so the stored
         # FEN matches the position that produced the visit-count policy vector.
@@ -52,6 +83,7 @@ def self_play_game(net, num_simulations=100, max_moves=140):
     winner     = game.check_winner()
     result_str = {1: "White wins", -1: "Black wins", 0: "Draw", None: "Unfinished"}.get(winner)
     print(f"Game Over! Result: {result_str}")
+    print_board_with_coords(game.board, human_is_white=True)
 
     rewards = []
     for player in players:

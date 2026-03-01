@@ -126,14 +126,18 @@ class MCTSNode:
 
 
 class MCTS:
-    def __init__(self, net, c_puct=1.0, num_simulations=100):
-        self.net            = net
-        self.c_puct         = c_puct
-        self.num_simulations = num_simulations
+    def __init__(self, net, c_puct=1.0, num_simulations=100, dirichlet_alpha=0.3, dirichlet_epsilon=0.25):
+        self.net               = net
+        self.c_puct            = c_puct
+        self.num_simulations   = num_simulations
+        self.dirichlet_alpha   = dirichlet_alpha    # controls noise shape (0.3 is standard for chess)
+        self.dirichlet_epsilon = dirichlet_epsilon  # how much noise to mix in (0.25 is AlphaZero standard)
 
-    def search(self, game):
+    def search(self, game, add_noise=False):
         root = MCTSNode(game)
         self.expand(root)
+        if add_noise and root.children:
+            self._add_dirichlet_noise(root)
         for _ in range(self.num_simulations):
             node        = root
             search_path = [node]
@@ -151,6 +155,14 @@ class MCTS:
                     value = 1 if winner != self.get_current_player(node) else -1
             self.backpropagate(search_path, value)
         return root
+
+    def _add_dirichlet_noise(self, root):
+        moves   = list(root.children.keys())
+        noise   = np.random.dirichlet([self.dirichlet_alpha] * len(moves))
+        eps     = self.dirichlet_epsilon
+        for move, eta in zip(moves, noise):
+            child       = root.children[move]
+            child.prior = (1 - eps) * child.prior + eps * eta
 
     def select_child(self, node):
         best_score = -float('inf')
