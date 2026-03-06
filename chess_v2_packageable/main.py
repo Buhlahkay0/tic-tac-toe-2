@@ -13,7 +13,9 @@ BATCH_SIZE             = 512
 
 def main():
     net       = ChessNet().to(device)
+    net       = torch.compile(net)
     optimizer = torch.optim.Adam(net.parameters(), lr=0.001)
+    scaler    = torch.cuda.GradScaler() if device.type == "cuda" else None
 
     checkpoint = "chess_model_checkpoint.pth"
     if os.path.exists(checkpoint):
@@ -81,7 +83,7 @@ def main():
             train_network(
                 net, optimizer,
                 list(b_states), list(b_probs), list(b_rewards), list(b_players),
-                epochs=1,
+                epochs=1, scaler=scaler,
             )
         else:
             remaining = MIN_BUFFER_FOR_TRAINING - len(replay_buffer)

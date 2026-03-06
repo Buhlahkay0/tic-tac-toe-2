@@ -26,7 +26,7 @@ class ResBlock(nn.Module):
 
 
 class ChessNet(nn.Module):
-    def __init__(self, num_res_blocks=10, channels=256, output_dim=OUTPUT_DIM):
+    def __init__(self, num_res_blocks=5, channels=256, output_dim=OUTPUT_DIM):
         super().__init__()
         self.input_block = nn.Sequential(
             nn.Conv2d(12, channels, 3, padding=1, bias=False),

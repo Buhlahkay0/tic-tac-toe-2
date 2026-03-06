@@ -95,9 +95,9 @@ def self_play_game(net, num_simulations=100, max_moves=100):
     return states, mcts_probs, rewards, players, winner
 
 
-def train_network(net, optimizer, states, mcts_probs, rewards, players, epochs=1):
+def train_network(net, optimizer, states, mcts_probs, rewards, players, epochs=1, scaler=None):
     """
-    Trains the network on a batch of self-play data.
+    Trains the network on a batch of self-play data using mixed precision if a scaler is provided.
     """
     net.train()
     for epoch in range(epochs):
@@ -106,14 +106,20 @@ def train_network(net, optimizer, states, mcts_probs, rewards, players, epochs=1
             board        = chess.Board(fen)
             board_tensor = board_to_tensor(board).to(device)
             optimizer.zero_grad()
-            log_pi, value = net(board_tensor)
-            value_target  = torch.tensor([[reward]], dtype=torch.float32).to(device)
-            value_loss    = (value - value_target).pow(2).mean()
-            target_pi     = torch.tensor(pi, dtype=torch.float32).unsqueeze(0).to(device)
-            policy_loss   = -torch.sum(target_pi * log_pi)
-            loss          = value_loss + policy_loss
-            loss.backward()
-            optimizer.step()
+            with torch.autocast(device_type=device.type, enabled=(scaler is not None)):
+                log_pi, value = net(board_tensor)
+                value_target  = torch.tensor([[reward]], dtype=torch.float32).to(device)
+                value_loss    = (value - value_target).pow(2).mean()
+                target_pi     = torch.tensor(pi, dtype=torch.float32).unsqueeze(0).to(device)
+                policy_loss   = -torch.sum(target_pi * log_pi)
+                loss          = value_loss + policy_loss
+            if scaler is not None:
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                optimizer.step()
             total_loss += loss.item()
         print(f"Epoch {epoch+1}, Loss: {total_loss / len(states):.4f}")
 
