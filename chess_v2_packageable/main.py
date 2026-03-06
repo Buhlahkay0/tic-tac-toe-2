@@ -46,6 +46,12 @@ def main():
         print("Invalid input. Defaulting to checkpoint saving every 10 iterations.")
         checkpoint_freq = 10
 
+    try:
+        max_moves = int(input("Enter the maximum moves per game (default 150): ") or "150")
+    except ValueError:
+        print("Invalid input. Defaulting to 150 moves.")
+        max_moves = 150
+
     replay_buffer = deque(maxlen=REPLAY_BUFFER_SIZE)
     white_wins = black_wins = draw_count = 0
 
@@ -53,7 +59,7 @@ def main():
         print(f"\nIteration {iteration+1}/{num_iterations}")
 
         states, mcts_probs, rewards, players, winner = self_play_game(
-            net, num_simulations=num_simulations
+            net, num_simulations=num_simulations, max_moves=max_moves
         )
 
         if winner == 1:
