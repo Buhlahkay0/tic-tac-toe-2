@@ -2,20 +2,40 @@ import os
 import random
 from collections import deque
 
+import chess
 import torch
-from network import ChessNet, device
-from train import self_play_game, train_network
+import torch.multiprocessing as mp
 
-REPLAY_BUFFER_SIZE     = 10_000
+from network import ChessNet, device
+from play_v3 import print_board_with_coords
+from train import train_network
+
+REPLAY_BUFFER_SIZE      = 10_000
 MIN_BUFFER_FOR_TRAINING = 512
-BATCH_SIZE             = 512
+BATCH_SIZE              = 512
+
+
+def _worker(weights_dict, num_simulations, max_moves, result_queue):
+    """
+    Runs one self-play game on CPU and puts the result into result_queue.
+    Must be a module-level function for Windows multiprocessing (spawn method).
+    """
+    from network import ChessNet
+    from train import self_play_game
+    net = ChessNet()           # CPU — each worker gets its own copy of the weights
+    net.load_state_dict(weights_dict)
+    net.eval()
+    result = self_play_game(
+        net, num_simulations=num_simulations, max_moves=max_moves, verbose=False
+    )
+    result_queue.put(result)
 
 
 def main():
     net       = ChessNet().to(device)
     net       = torch.compile(net, backend="eager")
     optimizer = torch.optim.Adam(net.parameters(), lr=0.001)
-    scaler    = torch.cuda.GradScaler() if device.type == "cuda" else None
+    scaler    = torch.amp.GradScaler("cuda") if device.type == "cuda" else None
 
     checkpoint = "chess_model_checkpoint.pth"
     if os.path.exists(checkpoint):
@@ -37,10 +57,10 @@ def main():
         num_iterations = 200
 
     try:
-        num_simulations = int(input("Enter the number of simulations for self-play (default 200): ") or "200")
+        num_simulations = int(input("Enter the number of simulations for self-play (default 100): ") or "100")
     except ValueError:
-        print("Invalid input. Defaulting to 200 simulations.")
-        num_simulations = 200
+        print("Invalid input. Defaulting to 100 simulations.")
+        num_simulations = 100
 
     try:
         checkpoint_freq = int(input("Enter checkpoint save frequency (default 10): ") or "10")
@@ -54,26 +74,58 @@ def main():
         print("Invalid input. Defaulting to 150 moves.")
         max_moves = 150
 
+    try:
+        num_workers = int(input("Enter number of parallel self-play workers (default 4): ") or "4")
+    except ValueError:
+        print("Invalid input. Defaulting to 4 workers.")
+        num_workers = 4
+
     replay_buffer = deque(maxlen=REPLAY_BUFFER_SIZE)
     white_wins = black_wins = draw_count = 0
 
     for iteration in range(num_iterations):
-        print(f"\nIteration {iteration+1}/{num_iterations}")
+        print(f"\nIteration {iteration+1}/{num_iterations} — running {num_workers} games in parallel")
 
-        states, mcts_probs, rewards, players, winner = self_play_game(
-            net, num_simulations=num_simulations, max_moves=max_moves
-        )
+        # Copy weights to CPU for workers (avoids CUDA/fork issues on Windows)
+        cpu_weights = {k: v.cpu() for k, v in net.state_dict().items()}
 
-        if winner == 1:
-            white_wins += 1
-        elif winner == -1:
-            black_wins += 1
-        else:
-            draw_count += 1
+        # Spawn worker processes
+        result_queue = mp.Queue()
+        processes    = []
+        for _ in range(num_workers):
+            p = mp.Process(
+                target=_worker,
+                args=(cpu_weights, num_simulations, max_moves, result_queue),
+            )
+            p.start()
+            processes.append(p)
+
+        # Collect results as workers finish
+        all_results = [result_queue.get() for _ in range(num_workers)]
+        for p in processes:
+            p.join()
+
+        # Process results from all games this iteration
+        last_final_fen = None
+        for i, (states, mcts_probs, rewards, players, winner, final_fen) in enumerate(all_results):
+            result_str = {1: "White wins", -1: "Black wins", 0: "Draw", None: "Unfinished"}.get(winner)
+            print(f"  Game {i+1}: {result_str} ({len(states)} moves)")
+
+            if winner == 1:
+                white_wins += 1
+            elif winner == -1:
+                black_wins += 1
+            else:
+                draw_count += 1
+
+            replay_buffer.extend(zip(states, mcts_probs, rewards, players))
+            last_final_fen = final_fen
+
         print(f"  Stats — White: {white_wins}, Black: {black_wins}, Draws: {draw_count}")
 
-        # Add this game's data to the replay buffer
-        replay_buffer.extend(zip(states, mcts_probs, rewards, players))
+        # Print final board from the last game
+        if last_final_fen:
+            print_board_with_coords(chess.Board(last_final_fen), human_is_white=True)
 
         # Train from a random batch once the buffer is large enough
         if len(replay_buffer) >= MIN_BUFFER_FOR_TRAINING:

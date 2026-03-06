@@ -18,12 +18,13 @@ def _select_move_with_temperature(visit_counts):
     return moves[np.random.choice(len(moves), p=probs)]
 
 
-def self_play_game(net, num_simulations=100, max_moves=100):
+def self_play_game(net, num_simulations=100, max_moves=100, verbose=True):
     """
     Runs a single self-play game using MCTS for move selection.
     States and player labels are recorded BEFORE each move so they correspond
     to the position that generated the policy vector.
-    Returns training data plus the final winner (1, -1, 0, or None).
+    Returns training data, the final winner, and the final board FEN.
+    Set verbose=False to suppress all output (used by parallel workers).
     """
     game  = ChessGame()
     mcts  = MCTS(net, num_simulations=num_simulations)
@@ -32,7 +33,8 @@ def self_play_game(net, num_simulations=100, max_moves=100):
 
     while not game.is_terminal():
         if move_count >= max_moves:
-            print("Game ended: move limit reached.")
+            if verbose:
+                print("Game ended: move limit reached.")
             break
 
         root        = mcts.search(game, add_noise=True)
@@ -43,7 +45,8 @@ def self_play_game(net, num_simulations=100, max_moves=100):
         }
 
         if not visit_counts:
-            print("No valid moves left. Game over.")
+            if verbose:
+                print("No valid moves left. Game over.")
             break
 
         # Filter out moves that would immediately allow a draw claim, unless
@@ -57,7 +60,8 @@ def self_play_game(net, num_simulations=100, max_moves=100):
         if non_draw_moves:
             visit_counts = non_draw_moves
         else:
-            print("Game ended: draw unavoidable.")
+            if verbose:
+                print("Game ended: draw unavoidable.")
             break
 
         # Temperature sampling for early moves, greedy afterwards.
@@ -81,9 +85,11 @@ def self_play_game(net, num_simulations=100, max_moves=100):
         move_count += 1
 
     winner     = game.check_winner()
+    final_fen  = game.board.fen()
     result_str = {1: "White wins", -1: "Black wins", 0: "Draw", None: "Unfinished"}.get(winner)
-    print(f"Game Over! Result: {result_str}")
-    print_board_with_coords(game.board, human_is_white=True)
+    if verbose:
+        print(f"Game Over! Result: {result_str}")
+        print_board_with_coords(game.board, human_is_white=True)
 
     rewards = []
     for player in players:
@@ -92,7 +98,7 @@ def self_play_game(net, num_simulations=100, max_moves=100):
         else:
             rewards.append(1 if winner == player else -1)
 
-    return states, mcts_probs, rewards, players, winner
+    return states, mcts_probs, rewards, players, winner, final_fen
 
 
 def train_network(net, optimizer, states, mcts_probs, rewards, players, epochs=1, scaler=None):
@@ -134,7 +140,7 @@ if __name__ == "__main__":
 
     for iteration in range(num_iterations):
         print(f"Iteration {iteration+1}/{num_iterations}")
-        states, mcts_probs, rewards, players, _ = self_play_game(net, num_simulations=100)
+        states, mcts_probs, rewards, players, _, _fen = self_play_game(net, num_simulations=100)
         train_network(net, optimizer, states, mcts_probs, rewards, players, epochs=1)
         if (iteration + 1) % checkpoint_freq == 0 or (iteration + 1) == num_iterations:
             torch.save(
