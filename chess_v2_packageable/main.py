@@ -13,7 +13,7 @@ BATCH_SIZE             = 512
 
 def main():
     net       = ChessNet().to(device)
-    net       = torch.compile(net)
+    net       = torch.compile(net, backend="eager")
     optimizer = torch.optim.Adam(net.parameters(), lr=0.001)
     scaler    = torch.cuda.GradScaler() if device.type == "cuda" else None
 
