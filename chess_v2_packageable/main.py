@@ -2,8 +2,10 @@ import os
 import random
 from collections import deque
 
+import chess
 import torch
 from network import ChessNet, device
+from play_v3 import print_board_with_coords
 from train import self_play_game, train_network
 
 REPLAY_BUFFER_SIZE     = 10_000
@@ -13,9 +15,8 @@ BATCH_SIZE             = 512
 
 def main():
     net       = ChessNet().to(device)
-    net       = torch.compile(net, backend="eager")
     optimizer = torch.optim.Adam(net.parameters(), lr=0.001)
-    scaler    = torch.cuda.GradScaler() if device.type == "cuda" else None
+    scaler    = torch.amp.GradScaler("cuda") if device.type == "cuda" else None
 
     checkpoint = "chess_model_checkpoint.pth"
     if os.path.exists(checkpoint):
@@ -29,6 +30,8 @@ def main():
             print("Loaded old checkpoint with model weights only.")
     else:
         print("No checkpoint found. Starting from scratch.")
+
+    net = torch.compile(net, backend="eager")
 
     try:
         num_iterations = int(input("Enter the number of iterations (default 200): ") or "200")
@@ -60,7 +63,7 @@ def main():
     for iteration in range(num_iterations):
         print(f"\nIteration {iteration+1}/{num_iterations}")
 
-        states, mcts_probs, rewards, players, winner = self_play_game(
+        states, mcts_probs, rewards, players, winner, final_fen = self_play_game(
             net, num_simulations=num_simulations, max_moves=max_moves
         )
 
@@ -71,6 +74,9 @@ def main():
         else:
             draw_count += 1
         print(f"  Stats — White: {white_wins}, Black: {black_wins}, Draws: {draw_count}")
+
+        if final_fen:
+            print_board_with_coords(chess.Board(final_fen), human_is_white=True)
 
         # Add this game's data to the replay buffer
         replay_buffer.extend(zip(states, mcts_probs, rewards, players))
