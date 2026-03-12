@@ -57,6 +57,12 @@ def main():
         print("Invalid input. Defaulting to 150 moves.")
         max_moves = 150
 
+    try:
+        eval_batch_size = int(input("Enter MCTS eval batch size (default 16, higher = faster but less accurate): ") or "16")
+    except ValueError:
+        print("Invalid input. Defaulting to 16.")
+        eval_batch_size = 16
+
     replay_buffer = deque(maxlen=REPLAY_BUFFER_SIZE)
     white_wins = black_wins = draw_count = 0
 
@@ -64,7 +70,7 @@ def main():
         print(f"\nIteration {iteration+1}/{num_iterations}")
 
         states, mcts_probs, rewards, players, winner, final_fen = self_play_game(
-            net, num_simulations=num_simulations, max_moves=max_moves
+            net, num_simulations=num_simulations, max_moves=max_moves, eval_batch_size=eval_batch_size
         )
 
         if winner == 1:

@@ -38,6 +38,8 @@ _KNIGHT_MOVE_MAP = {m: i for i, m in enumerate(_KNIGHT_MOVES)}
 _UNDER_PROMO_PIECES = [chess.KNIGHT, chess.BISHOP, chess.ROOK]
 _UNDER_PROMO_MAP = {p: i for i, p in enumerate(_UNDER_PROMO_PIECES)}
 
+VIRTUAL_LOSS = 3  # Penalty applied during selection to discourage duplicate paths
+
 
 def move_to_index(move):
     """Deterministically map a chess.Move to an integer in [0, OUTPUT_DIM)."""
@@ -126,35 +128,121 @@ class MCTSNode:
 
 
 class MCTS:
-    def __init__(self, net, c_puct=1.0, num_simulations=100, dirichlet_alpha=0.3, dirichlet_epsilon=0.25):
+    def __init__(self, net, c_puct=1.0, num_simulations=100, dirichlet_alpha=0.3,
+                 dirichlet_epsilon=0.25, eval_batch_size=8):
         self.net               = net
         self.c_puct            = c_puct
         self.num_simulations   = num_simulations
         self.dirichlet_alpha   = dirichlet_alpha    # controls noise shape (0.3 is standard for chess)
         self.dirichlet_epsilon = dirichlet_epsilon  # how much noise to mix in (0.25 is AlphaZero standard)
+        self.eval_batch_size   = eval_batch_size    # number of leaves to evaluate per forward pass
 
     def search(self, game, add_noise=False):
         root = MCTSNode(game)
-        self.expand(root)
+        self._batch_expand([root])
         if add_noise and root.children:
             self._add_dirichlet_noise(root)
-        for _ in range(self.num_simulations):
-            node        = root
-            search_path = [node]
-            while node.is_fully_expanded() and not node.game.is_terminal():
-                move, node = self.select_child(node)
-                search_path.append(node)
-            if not node.game.is_terminal():
-                self.expand(node)
-                value = self.evaluate(node)
-            else:
-                winner = node.game.check_winner()
-                if winner == 0:
-                    value = 0
+
+        sims_done = 0
+        while sims_done < self.num_simulations:
+            batch_n = min(self.eval_batch_size, self.num_simulations - sims_done)
+
+            # Phase 1: select one leaf per simulation path, applying virtual loss
+            leaves, paths = [], []
+            for _ in range(batch_n):
+                node = root
+                path = [node]
+                while node.is_fully_expanded() and not node.game.is_terminal():
+                    _, node = self.select_child(node)
+                    path.append(node)
+                self._apply_virtual_loss(path)
+                leaves.append(node)
+                paths.append(path)
+
+            # Phase 2: batch-expand all unique unexpanded non-terminal leaves
+            to_expand, seen = [], set()
+            for node in leaves:
+                nid = id(node)
+                if not node.game.is_terminal() and not node.children and nid not in seen:
+                    to_expand.append(node)
+                    seen.add(nid)
+
+            expand_values = {}
+            if to_expand:
+                vals = self._batch_expand(to_expand)
+                for node, val in zip(to_expand, vals):
+                    expand_values[id(node)] = val
+
+            # Phase 3: remove virtual loss and backpropagate
+            for node, path in zip(leaves, paths):
+                if node.game.is_terminal():
+                    winner = node.game.check_winner()
+                    value  = 0 if winner == 0 else (1 if winner != self.get_current_player(node) else -1)
+                elif id(node) in expand_values:
+                    value = expand_values[id(node)]
                 else:
-                    value = 1 if winner != self.get_current_player(node) else -1
-            self.backpropagate(search_path, value)
+                    # Duplicate leaf expanded by another path in this batch — evaluate individually
+                    value = self._evaluate(node)
+
+                self._remove_virtual_loss(path)
+                self.backpropagate(path, value)
+
+            sims_done += batch_n
+
         return root
+
+    def _batch_expand(self, nodes):
+        """
+        Expand a list of non-terminal nodes with a single batched forward pass.
+        Assigns policy priors to each node's children and returns their values.
+        """
+        tensors = [board_to_tensor(n.game.board) for n in nodes]
+        batch   = torch.cat(tensors, dim=0)
+
+        with torch.no_grad():
+            log_policies, values = self.net(batch)
+
+        policies = log_policies.exp().cpu().numpy()
+        values   = values.cpu().numpy().flatten()
+
+        for i, node in enumerate(nodes):
+            valid_moves = node.game.get_valid_moves()
+            if not valid_moves:
+                continue
+            policy = policies[i]
+
+            move_priors = {move: float(policy[move_to_index(move)]) for move in valid_moves}
+            total = sum(move_priors.values())
+            if total > 0:
+                move_priors = {m: p / total for m, p in move_priors.items()}
+            else:
+                uniform = 1.0 / len(valid_moves)
+                move_priors = {m: uniform for m in valid_moves}
+
+            for move in valid_moves:
+                if move not in node.children:
+                    new_game = node.game.clone()
+                    new_game.make_move(move)
+                    node.children[move] = MCTSNode(new_game, parent=node, prior=move_priors[move])
+
+        return values.tolist()
+
+    def _evaluate(self, node):
+        """Single-node value evaluation (fallback for duplicate leaves in a batch)."""
+        board_tensor = board_to_tensor(node.game.board)
+        with torch.no_grad():
+            _, value = self.net(board_tensor)
+        return value.item()
+
+    def _apply_virtual_loss(self, path):
+        for node in path:
+            node.visit_count += VIRTUAL_LOSS
+            node.value_sum   -= VIRTUAL_LOSS
+
+    def _remove_virtual_loss(self, path):
+        for node in path:
+            node.visit_count -= VIRTUAL_LOSS
+            node.value_sum   += VIRTUAL_LOSS
 
     def _add_dirichlet_noise(self, root):
         moves   = list(root.children.keys())
@@ -177,41 +265,6 @@ class MCTS:
                 best_move  = move
                 best_child = child
         return best_move, best_child
-
-    def expand(self, node):
-        if node.game.is_terminal():
-            return
-        valid_moves  = node.game.get_valid_moves()
-        board_tensor = board_to_tensor(node.game.board)
-        with torch.no_grad():
-            policy, _ = self.net(board_tensor)
-        policy = policy.exp().cpu().numpy().flatten()
-
-        move_priors = {}
-        total_prior = 0
-        for move in valid_moves:
-            p = policy[move_to_index(move)]
-            move_priors[move] = p
-            total_prior += p
-        if total_prior > 0:
-            for move in move_priors:
-                move_priors[move] /= total_prior
-        else:
-            uniform = 1.0 / len(valid_moves)
-            for move in valid_moves:
-                move_priors[move] = uniform
-
-        for move in valid_moves:
-            if move not in node.children:
-                new_game = node.game.clone()
-                new_game.make_move(move)
-                node.children[move] = MCTSNode(new_game, parent=node, prior=move_priors[move])
-
-    def evaluate(self, node):
-        board_tensor = board_to_tensor(node.game.board)
-        with torch.no_grad():
-            _, value = self.net(board_tensor)
-        return value.item()
 
     def backpropagate(self, search_path, value):
         for node in reversed(search_path):
