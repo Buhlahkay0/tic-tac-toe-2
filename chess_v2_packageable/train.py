@@ -18,7 +18,7 @@ def _select_move_with_temperature(visit_counts):
     return moves[np.random.choice(len(moves), p=probs)]
 
 
-def self_play_game(net, num_simulations=100, max_moves=100, verbose=True):
+def self_play_game(net, num_simulations=100, max_moves=100, verbose=True, device=None):
     """
     Runs a single self-play game using MCTS for move selection.
     States and player labels are recorded BEFORE each move so they correspond
@@ -27,7 +27,7 @@ def self_play_game(net, num_simulations=100, max_moves=100, verbose=True):
     Set verbose=False to suppress all output (used by parallel workers).
     """
     game  = ChessGame()
-    mcts  = MCTS(net, num_simulations=num_simulations)
+    mcts  = MCTS(net, num_simulations=num_simulations, device=device)
     states, mcts_probs, players = [], [], []
     move_count = 0
 

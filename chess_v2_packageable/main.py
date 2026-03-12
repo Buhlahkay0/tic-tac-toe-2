@@ -26,17 +26,19 @@ def _worker(weights_dict, num_simulations, max_moves, result_queue):
     net.load_state_dict(weights_dict)
     net.eval()
     result = self_play_game(
-        net, num_simulations=num_simulations, max_moves=max_moves, verbose=False
+        net, num_simulations=num_simulations, max_moves=max_moves,
+        verbose=False, device=torch.device("cpu"),
     )
     result_queue.put(result)
 
 
 def main():
     net       = ChessNet().to(device)
-    net       = torch.compile(net, backend="eager")
     optimizer = torch.optim.Adam(net.parameters(), lr=0.001)
     scaler    = torch.amp.GradScaler("cuda") if device.type == "cuda" else None
 
+    # Load checkpoint BEFORE compiling — compiled models prefix keys with _orig_mod.
+    # which would cause mismatches if loaded after torch.compile.
     checkpoint = "chess_model_checkpoint.pth"
     if os.path.exists(checkpoint):
         checkpoint_data = torch.load(checkpoint, map_location=device)
@@ -49,6 +51,8 @@ def main():
             print("Loaded old checkpoint with model weights only.")
     else:
         print("No checkpoint found. Starting from scratch.")
+
+    net = torch.compile(net, backend="eager")
 
     try:
         num_iterations = int(input("Enter the number of iterations (default 200): ") or "200")
@@ -86,8 +90,12 @@ def main():
     for iteration in range(num_iterations):
         print(f"\nIteration {iteration+1}/{num_iterations} — running {num_workers} games in parallel")
 
-        # Copy weights to CPU for workers (avoids CUDA/fork issues on Windows)
-        cpu_weights = {k: v.cpu() for k, v in net.state_dict().items()}
+        # Copy weights to CPU for workers. Strip the _orig_mod. prefix that
+        # torch.compile adds so workers can load into an uncompiled ChessNet.
+        cpu_weights = {
+            k.replace("_orig_mod.", ""): v.cpu()
+            for k, v in net.state_dict().items()
+        }
 
         # Spawn worker processes
         result_queue = mp.Queue()

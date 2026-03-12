@@ -126,12 +126,16 @@ class MCTSNode:
 
 
 class MCTS:
-    def __init__(self, net, c_puct=1.0, num_simulations=100, dirichlet_alpha=0.3, dirichlet_epsilon=0.25):
+    def __init__(self, net, c_puct=1.0, num_simulations=100, dirichlet_alpha=0.3, dirichlet_epsilon=0.25, device=None):
         self.net               = net
         self.c_puct            = c_puct
         self.num_simulations   = num_simulations
-        self.dirichlet_alpha   = dirichlet_alpha    # controls noise shape (0.3 is standard for chess)
-        self.dirichlet_epsilon = dirichlet_epsilon  # how much noise to mix in (0.25 is AlphaZero standard)
+        self.dirichlet_alpha   = dirichlet_alpha
+        self.dirichlet_epsilon = dirichlet_epsilon
+        # Allow callers to specify a device (e.g. CPU for parallel workers).
+        # Falls back to the global device from network.py if not specified.
+        import network as _net_module
+        self.device = device if device is not None else _net_module.device
 
     def search(self, game, add_noise=False):
         root = MCTSNode(game)
@@ -182,7 +186,7 @@ class MCTS:
         if node.game.is_terminal():
             return
         valid_moves  = node.game.get_valid_moves()
-        board_tensor = board_to_tensor(node.game.board)
+        board_tensor = board_to_tensor(node.game.board, device=self.device)
         with torch.no_grad():
             policy, _ = self.net(board_tensor)
         policy = policy.exp().cpu().numpy().flatten()
@@ -208,7 +212,7 @@ class MCTS:
                 node.children[move] = MCTSNode(new_game, parent=node, prior=move_priors[move])
 
     def evaluate(self, node):
-        board_tensor = board_to_tensor(node.game.board)
+        board_tensor = board_to_tensor(node.game.board, device=self.device)
         with torch.no_grad():
             _, value = self.net(board_tensor)
         return value.item()
