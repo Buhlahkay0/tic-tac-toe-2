@@ -274,3 +274,78 @@ class MCTS:
 
     def get_current_player(self, node):
         return 1 if node.game.board.turn == chess.WHITE else -1
+
+    def collect_leaves(self, root, n):
+        """
+        Run n selection walks from root, applying virtual loss to each path.
+        Returns (leaves, paths, board_tensors) where board_tensors is a list of
+        tensors for all non-terminal unexpanded leaves (unique nodes only).
+        The returned leaves and paths lists have length n (one per walk).
+        board_tensors corresponds to the unique nodes that need GPU evaluation.
+        """
+        leaves, paths = [], []
+        for _ in range(n):
+            node = root
+            path = [node]
+            while node.is_fully_expanded() and not node.game.is_terminal():
+                _, node = self.select_child(node)
+                path.append(node)
+            self._apply_virtual_loss(path)
+            leaves.append(node)
+            paths.append(path)
+
+        # Collect unique unexpanded non-terminal nodes for batched GPU eval
+        to_expand, seen = [], set()
+        for node in leaves:
+            nid = id(node)
+            if not node.game.is_terminal() and not node.children and nid not in seen:
+                to_expand.append(node)
+                seen.add(nid)
+
+        board_tensors = [board_to_tensor(n.game.board) for n in to_expand]
+        return leaves, paths, to_expand, board_tensors
+
+    def process_leaves(self, root, leaves, paths, to_expand, policies_np, values_np):
+        """
+        Expand nodes and backpropagate using pre-computed policy/value arrays.
+        policies_np and values_np are numpy arrays with one row per node in to_expand.
+        Removes virtual loss from all paths before backpropagating.
+        """
+        # Expand each node using its corresponding policy/value
+        expand_values = {}
+        for i, node in enumerate(to_expand):
+            valid_moves = node.game.get_valid_moves()
+            if not valid_moves:
+                expand_values[id(node)] = float(values_np[i])
+                continue
+
+            policy = policies_np[i]
+            move_priors = {move: float(policy[move_to_index(move)]) for move in valid_moves}
+            total = sum(move_priors.values())
+            if total > 0:
+                move_priors = {m: p / total for m, p in move_priors.items()}
+            else:
+                uniform = 1.0 / len(valid_moves)
+                move_priors = {m: uniform for m in valid_moves}
+
+            for move in valid_moves:
+                if move not in node.children:
+                    new_game = node.game.clone()
+                    new_game.make_move(move)
+                    node.children[move] = MCTSNode(new_game, parent=node, prior=move_priors[move])
+
+            expand_values[id(node)] = float(values_np[i])
+
+        # Remove virtual loss and backpropagate
+        for node, path in zip(leaves, paths):
+            if node.game.is_terminal():
+                winner = node.game.check_winner()
+                value = 0 if winner == 0 else (1 if winner != self.get_current_player(node) else -1)
+            elif id(node) in expand_values:
+                value = expand_values[id(node)]
+            else:
+                # Duplicate leaf — evaluate individually
+                value = self._evaluate(node)
+
+            self._remove_virtual_loss(path)
+            self.backpropagate(path, value)

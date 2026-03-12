@@ -6,7 +6,7 @@ import chess
 import torch
 from network import ChessNet, device
 from play_v3 import print_board_with_coords
-from train import self_play_game, train_network
+from train import self_play_game, batched_self_play, train_network
 
 REPLAY_BUFFER_SIZE     = 10_000
 MIN_BUFFER_FOR_TRAINING = 512
@@ -63,29 +63,42 @@ def main():
         print("Invalid input. Defaulting to 16.")
         eval_batch_size = 16
 
+    try:
+        num_parallel_games = int(input("Enter number of parallel self-play games (default 4): ") or "4")
+    except ValueError:
+        print("Invalid input. Defaulting to 4 parallel games.")
+        num_parallel_games = 4
+
     replay_buffer = deque(maxlen=REPLAY_BUFFER_SIZE)
     white_wins = black_wins = draw_count = 0
 
     for iteration in range(num_iterations):
         print(f"\nIteration {iteration+1}/{num_iterations}")
 
-        states, mcts_probs, rewards, players, winner, final_fen = self_play_game(
-            net, num_simulations=num_simulations, max_moves=max_moves, eval_batch_size=eval_batch_size
+        game_results = batched_self_play(
+            net,
+            num_games=num_parallel_games,
+            num_simulations=num_simulations,
+            max_moves=max_moves,
+            eval_batch_size=eval_batch_size,
         )
 
-        if winner == 1:
-            white_wins += 1
-        elif winner == -1:
-            black_wins += 1
-        else:
-            draw_count += 1
+        final_fen = None
+        for states, mcts_probs, rewards, players, winner, game_fen in game_results:
+            if winner == 1:
+                white_wins += 1
+            elif winner == -1:
+                black_wins += 1
+            else:
+                draw_count += 1
+            # Add each game's data to the replay buffer
+            replay_buffer.extend(zip(states, mcts_probs, rewards, players))
+            final_fen = game_fen
+
         print(f"  Stats — White: {white_wins}, Black: {black_wins}, Draws: {draw_count}")
 
         if final_fen:
             print_board_with_coords(chess.Board(final_fen), human_is_white=True)
-
-        # Add this game's data to the replay buffer
-        replay_buffer.extend(zip(states, mcts_probs, rewards, players))
 
         # Train from a random batch once the buffer is large enough
         if len(replay_buffer) >= MIN_BUFFER_FOR_TRAINING:
