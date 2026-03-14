@@ -33,12 +33,6 @@ def main():
     else:
         print("No checkpoint found. Starting from scratch.")
 
-    if device.type == "cuda":
-        try:
-            net = torch.compile(net)
-            print("torch.compile enabled.")
-        except Exception as e:
-            print(f"torch.compile unavailable ({e}), continuing without.")
 
     try:
         num_iterations = int(input("Enter the number of iterations (default 200): ") or "200")
@@ -91,12 +85,7 @@ def main():
         for iteration in range(num_iterations):
             print(f"\nIteration {iteration+1}/{num_iterations}")
 
-            # torch.compile prefixes all state dict keys with "_orig_mod." — strip
-            # that prefix so a plain ChessNet() in each worker can load the weights.
-            cpu_weights = {
-                (k[len('_orig_mod.'):] if k.startswith('_orig_mod.') else k): v.cpu()
-                for k, v in net.state_dict().items()
-            }
+            cpu_weights = {k: v.cpu() for k, v in net.state_dict().items()}
             worker_args = [(cpu_weights, num_simulations, max_moves, eval_batch_size)] * num_workers
 
             # All workers run in parallel; we block until all finish
