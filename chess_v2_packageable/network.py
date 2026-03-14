@@ -64,6 +64,12 @@ class ChessNet(nn.Module):
         return policy, value
 
 
+_WHITE_CH = {chess.PAWN: 0, chess.KNIGHT: 1, chess.BISHOP: 2,
+             chess.ROOK: 3, chess.QUEEN:  4, chess.KING:   5}
+_BLACK_CH = {chess.PAWN: 6, chess.KNIGHT: 7, chess.BISHOP: 8,
+             chess.ROOK: 9, chess.QUEEN: 10, chess.KING:  11}
+
+
 def board_to_tensor(chess_board, device=device):
     """
     Convert a python-chess Board into a 12x8x8 tensor on the specified device.
@@ -76,23 +82,28 @@ def board_to_tensor(chess_board, device=device):
 
     Row 0 corresponds to rank 8.
     """
-    board_tensor = np.zeros((12, 8, 8), dtype=np.float32)
-    piece_map = chess_board.piece_map()
-    for square, piece in piece_map.items():
+    arr = np.zeros((12, 8, 8), dtype=np.float32)
+    for square, piece in chess_board.piece_map().items():
         row = 7 - (square // 8)
         col = square % 8
-        if piece.color == chess.WHITE:
-            channel = {
-                chess.PAWN: 0, chess.KNIGHT: 1, chess.BISHOP: 2,
-                chess.ROOK: 3, chess.QUEEN: 4,  chess.KING: 5,
-            }[piece.piece_type]
-        else:
-            channel = {
-                chess.PAWN: 6, chess.KNIGHT: 7, chess.BISHOP: 8,
-                chess.ROOK: 9, chess.QUEEN: 10, chess.KING: 11,
-            }[piece.piece_type]
-        board_tensor[channel, row, col] = 1.0
-    return torch.from_numpy(board_tensor).unsqueeze(0).to(device)
+        ch = _WHITE_CH[piece.piece_type] if piece.color == chess.WHITE else _BLACK_CH[piece.piece_type]
+        arr[ch, row, col] = 1.0
+    return torch.from_numpy(arr).unsqueeze(0).to(device)
+
+
+def boards_to_batch(boards):
+    """
+    Convert a list of chess.Board objects into a single (N, 12, 8, 8) CPU tensor.
+    Caller does one .to(device) for the whole batch instead of N individual transfers.
+    """
+    arr = np.zeros((len(boards), 12, 8, 8), dtype=np.float32)
+    for i, board in enumerate(boards):
+        for square, piece in board.piece_map().items():
+            row = 7 - (square // 8)
+            col = square % 8
+            ch = _WHITE_CH[piece.piece_type] if piece.color == chess.WHITE else _BLACK_CH[piece.piece_type]
+            arr[i, ch, row, col] = 1.0
+    return torch.from_numpy(arr)
 
 
 if __name__ == "__main__":

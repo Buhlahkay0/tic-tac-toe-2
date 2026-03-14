@@ -5,7 +5,7 @@ import random
 import chess
 
 from chess_game import ChessGame
-from network import board_to_tensor, OUTPUT_DIM
+from network import board_to_tensor, boards_to_batch, OUTPUT_DIM, device as _default_device
 
 # ── Deterministic move encoding ───────────────────────────────────────────────
 # Follows AlphaZero's 4672-plane action space: from_square (64) × move_type (73)
@@ -129,13 +129,14 @@ class MCTSNode:
 
 class MCTS:
     def __init__(self, net, c_puct=1.0, num_simulations=100, dirichlet_alpha=0.3,
-                 dirichlet_epsilon=0.25, eval_batch_size=8):
+                 dirichlet_epsilon=0.25, eval_batch_size=8, device=None):
         self.net               = net
         self.c_puct            = c_puct
         self.num_simulations   = num_simulations
         self.dirichlet_alpha   = dirichlet_alpha    # controls noise shape (0.3 is standard for chess)
         self.dirichlet_epsilon = dirichlet_epsilon  # how much noise to mix in (0.25 is AlphaZero standard)
         self.eval_batch_size   = eval_batch_size    # number of leaves to evaluate per forward pass
+        self.device            = device if device is not None else _default_device
 
     def search(self, game, add_noise=False):
         root = MCTSNode(game)
@@ -196,8 +197,7 @@ class MCTS:
         Expand a list of non-terminal nodes with a single batched forward pass.
         Assigns policy priors to each node's children and returns their values.
         """
-        tensors = [board_to_tensor(n.game.board) for n in nodes]
-        batch   = torch.cat(tensors, dim=0)
+        batch = boards_to_batch([n.game.board for n in nodes]).to(self.device)
 
         with torch.no_grad():
             log_policies, values = self.net(batch)
@@ -229,7 +229,7 @@ class MCTS:
 
     def _evaluate(self, node):
         """Single-node value evaluation (fallback for duplicate leaves in a batch)."""
-        board_tensor = board_to_tensor(node.game.board)
+        board_tensor = board_to_tensor(node.game.board, device=self.device)
         with torch.no_grad():
             _, value = self.net(board_tensor)
         return value.item()
