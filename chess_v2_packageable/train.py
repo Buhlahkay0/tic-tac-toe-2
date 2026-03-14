@@ -238,10 +238,12 @@ def batched_self_play(net, num_games=4, num_simulations=100, max_moves=150,
                 roots[i], batch_n
             )
             pending[i] = (leaves, paths, to_expand)
-            all_tensors.extend(board_tensors)
+            if board_tensors.shape[0] > 0:
+                all_tensors.append(board_tensors)
 
         # Single batched GPU forward pass over ALL games' leaves.
-        # all_tensors are CPU tensors from collect_leaves; one .to(device) here.
+        # all_tensors is a list of (N_i, 12, 8, 8) CPU tensors, one per game.
+        # One cat + one .to(device) covers all games' leaves in a single transfer.
         if all_tensors:
             batch = torch.cat(all_tensors, dim=0).to(device)
             with torch.no_grad():
