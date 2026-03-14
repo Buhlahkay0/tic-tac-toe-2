@@ -91,11 +91,12 @@ def main():
         for iteration in range(num_iterations):
             print(f"\nIteration {iteration+1}/{num_iterations}")
 
-            # Extract weights from the underlying uncompiled model.
-            # torch.compile wraps the model and prefixes keys with "_orig_mod.",
-            # which a plain ChessNet() can't load. _orig_mod is the original module.
-            source = getattr(net, '_orig_mod', net)
-            cpu_weights = {k: v.cpu() for k, v in source.state_dict().items()}
+            # torch.compile prefixes all state dict keys with "_orig_mod." — strip
+            # that prefix so a plain ChessNet() in each worker can load the weights.
+            cpu_weights = {
+                (k[len('_orig_mod.'):] if k.startswith('_orig_mod.') else k): v.cpu()
+                for k, v in net.state_dict().items()
+            }
             worker_args = [(cpu_weights, num_simulations, max_moves, eval_batch_size)] * num_workers
 
             # All workers run in parallel; we block until all finish
