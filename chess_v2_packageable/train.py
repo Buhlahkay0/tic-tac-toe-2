@@ -1,10 +1,11 @@
 import random
 import torch
+import torch.nn.functional as F
 import chess
 import numpy as np
 from chess_game import ChessGame
 from mcts import MCTS, MCTSNode, move_to_index
-from network import ChessNet, board_to_tensor, OUTPUT_DIM, device
+from network import ChessNet, board_to_tensor, boards_to_batch, OUTPUT_DIM, device
 from play_v3 import print_board_with_coords
 
 TEMPERATURE_MOVES = 15  # use temperature sampling for the first N moves of each game
@@ -239,9 +240,10 @@ def batched_self_play(net, num_games=4, num_simulations=100, max_moves=150,
             pending[i] = (leaves, paths, to_expand)
             all_tensors.extend(board_tensors)
 
-        # Single batched GPU forward pass over ALL games' leaves
+        # Single batched GPU forward pass over ALL games' leaves.
+        # all_tensors are CPU tensors from collect_leaves; one .to(device) here.
         if all_tensors:
-            batch = torch.cat(all_tensors, dim=0)
+            batch = torch.cat(all_tensors, dim=0).to(device)
             with torch.no_grad():
                 log_policies, values_t = net(batch)
             policies_np = log_policies.exp().cpu().numpy()
@@ -286,31 +288,35 @@ def batched_self_play(net, num_games=4, num_simulations=100, max_moves=150,
 
 def train_network(net, optimizer, states, mcts_probs, rewards, players, epochs=1, scaler=None):
     """
-    Trains the network on a batch of self-play data using mixed precision if a scaler is provided.
+    Trains the network on a batch of self-play data.
+    All positions are evaluated in a single forward pass per epoch, which keeps
+    the GPU fully occupied instead of issuing hundreds of tiny batch-size-1 calls.
     """
     net.train()
+
+    # Build all tensors once on CPU, then move to device in one transfer.
+    boards      = [chess.Board(fen) for fen in states]
+    board_batch = boards_to_batch(boards).to(device)                          # (N, 12, 8, 8)
+    target_pi   = torch.tensor(mcts_probs, dtype=torch.float32, device=device)  # (N, OUTPUT_DIM)
+    target_v    = torch.tensor(rewards,    dtype=torch.float32, device=device).unsqueeze(1)  # (N, 1)
+
     for epoch in range(epochs):
-        total_loss = 0
-        for fen, pi, reward, player in zip(states, mcts_probs, rewards, players):
-            board        = chess.Board(fen)
-            board_tensor = board_to_tensor(board).to(device)
-            optimizer.zero_grad()
-            with torch.autocast(device_type=device.type, enabled=(scaler is not None)):
-                log_pi, value = net(board_tensor)
-                value_target  = torch.tensor([[reward]], dtype=torch.float32).to(device)
-                value_loss    = (value - value_target).pow(2).mean()
-                target_pi     = torch.tensor(pi, dtype=torch.float32).unsqueeze(0).to(device)
-                policy_loss   = -torch.sum(target_pi * log_pi)
-                loss          = value_loss + policy_loss
-            if scaler is not None:
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                loss.backward()
-                optimizer.step()
-            total_loss += loss.item()
-        print(f"Epoch {epoch+1}, Loss: {total_loss / len(states):.4f}")
+        optimizer.zero_grad()
+        with torch.autocast(device_type=device.type, enabled=(scaler is not None)):
+            log_pi, value = net(board_batch)                     # single forward pass
+            value_loss  = F.mse_loss(value, target_v)
+            policy_loss = -(target_pi * log_pi).sum(dim=1).mean()
+            loss        = value_loss + policy_loss
+
+        if scaler is not None:
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            optimizer.step()
+
+        print(f"Epoch {epoch+1}, Loss: {loss.item():.4f}")
 
 
 if __name__ == "__main__":

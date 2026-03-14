@@ -8,6 +8,11 @@ from network import ChessNet, device
 from play_v3 import print_board_with_coords
 from train import self_play_game, batched_self_play, train_network
 
+# Use all available CPU cores for PyTorch CPU-side tensor ops.
+_cpu_count = os.cpu_count() or 4
+torch.set_num_threads(_cpu_count)
+torch.set_num_interop_threads(max(1, _cpu_count // 2))
+
 REPLAY_BUFFER_SIZE     = 10_000
 MIN_BUFFER_FOR_TRAINING = 512
 BATCH_SIZE             = 512
@@ -31,7 +36,12 @@ def main():
     else:
         print("No checkpoint found. Starting from scratch.")
 
-    net = torch.compile(net, backend="eager")
+    if device.type == "cuda":
+        try:
+            net = torch.compile(net)
+            print("torch.compile enabled.")
+        except Exception as e:
+            print(f"torch.compile unavailable ({e}), running in eager mode.")
 
     try:
         num_iterations = int(input("Enter the number of iterations (default 200): ") or "200")

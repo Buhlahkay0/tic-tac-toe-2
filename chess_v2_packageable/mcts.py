@@ -5,7 +5,7 @@ import random
 import chess
 
 from chess_game import ChessGame
-from network import board_to_tensor, OUTPUT_DIM
+from network import board_to_tensor, boards_to_batch, OUTPUT_DIM, device
 
 # ── Deterministic move encoding ───────────────────────────────────────────────
 # Follows AlphaZero's 4672-plane action space: from_square (64) × move_type (73)
@@ -196,8 +196,7 @@ class MCTS:
         Expand a list of non-terminal nodes with a single batched forward pass.
         Assigns policy priors to each node's children and returns their values.
         """
-        tensors = [board_to_tensor(n.game.board) for n in nodes]
-        batch   = torch.cat(tensors, dim=0)
+        batch = boards_to_batch([n.game.board for n in nodes]).to(device)
 
         with torch.no_grad():
             log_policies, values = self.net(batch)
@@ -302,7 +301,9 @@ class MCTS:
                 to_expand.append(node)
                 seen.add(nid)
 
-        board_tensors = [board_to_tensor(n.game.board) for n in to_expand]
+        # Build a single CPU tensor — caller does one .to(device) for all games
+        board_tensors = boards_to_batch([n.game.board for n in to_expand]) \
+                        if to_expand else torch.zeros((0, 12, 8, 8))
         return leaves, paths, to_expand, board_tensors
 
     def process_leaves(self, root, leaves, paths, to_expand, policies_np, values_np):
