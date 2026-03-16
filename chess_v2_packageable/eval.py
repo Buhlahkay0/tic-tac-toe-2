@@ -23,6 +23,7 @@ import torch
 from chess_game import ChessGame
 from mcts import MCTS
 from network import ChessNet, device
+from play_v3 import print_board_with_coords
 
 
 def load_model(checkpoint_path, num_simulations=200):
@@ -48,14 +49,20 @@ def model_move(mcts, game):
 
 
 def random_move(game):
-    return random.choice(game.get_valid_moves())
+    moves = game.get_valid_moves()
+    non_draw = [m for m in moves if not _would_draw(game, m)]
+    return random.choice(non_draw if non_draw else moves)
+
+
+def _would_draw(game, move):
+    test = game.clone()
+    test.make_move(move)
+    return test.board.can_claim_draw()
 
 
 def play_one_game(net, num_simulations, model_is_white):
     """
-    Returns 1  if model wins
-            -1 if model loses
-             0 for draw / unfinished
+    Returns (result, final_fen) where result is 1 (win), -1 (loss), or 0 (draw).
     """
     game = ChessGame()
     mcts = MCTS(net, num_simulations=num_simulations)
@@ -63,6 +70,8 @@ def play_one_game(net, num_simulations, model_is_white):
     max_moves = 150
 
     while not game.is_terminal() and move_count < max_moves:
+        if game.board.can_claim_draw():
+            break
         model_turn = (game.board.turn == chess.WHITE) == model_is_white
         if model_turn:
             move = model_move(mcts, game)
@@ -74,18 +83,20 @@ def play_one_game(net, num_simulations, model_is_white):
     winner = game.check_winner()
     model_color = 1 if model_is_white else -1
     if winner == model_color:
-        return 1
+        return 1, game.board.fen()
     elif winner == -model_color:
-        return -1
-    return 0
+        return -1, game.board.fen()
+    return 0, game.board.fen()
 
 
 def vs_random(net, num_simulations, num_games=20):
     print(f"\n--- Model vs Random Mover ({num_games} games, {num_simulations} sims) ---")
     wins = losses = draws = 0
+    final_fen = None
     for i in range(num_games):
         model_is_white = (i % 2 == 0)   # alternate colors
-        result = play_one_game(net, num_simulations, model_is_white)
+        result, fen = play_one_game(net, num_simulations, model_is_white)
+        final_fen = fen
         if result == 1:
             wins += 1
         elif result == -1:
@@ -94,6 +105,7 @@ def vs_random(net, num_simulations, num_games=20):
             draws += 1
         print(f"  Game {i+1:2d}: {'WIN' if result==1 else 'LOSS' if result==-1 else 'DRAW'}"
               f"  (model {'White' if model_is_white else 'Black'})")
+        print_board_with_coords(chess.Board(fen), human_is_white=True)
 
     total = wins + losses + draws
     print(f"\nResult: {wins}W / {losses}L / {draws}D  "
@@ -127,8 +139,8 @@ def play_vs_stockfish(net, num_simulations, engine_path, depth, num_games=10):
             if model_turn:
                 move = model_move(mcts, game)
             else:
-                result = engine.play(game.board, chess.engine.Limit(depth=depth))
-                move = result.move
+                sf_result = engine.play(game.board, chess.engine.Limit(depth=depth))
+                move = sf_result.move
             game.make_move(move)
             move_count += 1
 
@@ -143,6 +155,7 @@ def play_vs_stockfish(net, num_simulations, engine_path, depth, num_games=10):
 
         print(f"  Game {i+1:2d}: {outcome}"
               f"  (model {'White' if model_is_white else 'Black'})")
+        print_board_with_coords(game.board, human_is_white=True)
 
     engine.quit()
     total = wins + losses + draws
@@ -161,10 +174,15 @@ def main():
     except ValueError:
         num_simulations = 200
 
+    try:
+        num_games = int(input("Number of games vs random (default 20): ") or "20")
+    except ValueError:
+        num_games = 20
+
     net = load_model(checkpoint, num_simulations)
 
     # Always run random baseline
-    vs_random(net, num_simulations, num_games=20)
+    vs_random(net, num_simulations, num_games=num_games)
 
     # Stockfish eval — try common locations
     sf_candidates = [
@@ -181,7 +199,11 @@ def main():
             depth = int(input("Stockfish depth (1=~700 ELO, 2=~1100 ELO, 3=~1500 ELO, default 1): ") or "1")
         except ValueError:
             depth = 1
-        play_vs_stockfish(net, num_simulations, sf_path or "stockfish", depth, num_games=10)
+        try:
+            sf_games = int(input("Number of games vs Stockfish (default 10): ") or "10")
+        except ValueError:
+            sf_games = 10
+        play_vs_stockfish(net, num_simulations, sf_path or "stockfish", depth, num_games=sf_games)
 
 
 if __name__ == "__main__":
