@@ -1,0 +1,188 @@
+"""
+eval.py — Quick benchmark for the chess model.
+
+Runs two tests:
+  1. Model vs random mover  (no extra tools needed)
+  2. Model vs Stockfish     (requires stockfish.exe in PATH or same folder)
+
+A random mover is ~200 ELO.
+Stockfish depth 1  is ~600-800 ELO.
+Stockfish depth 2  is ~1000-1200 ELO.
+Stockfish depth 3  is ~1400-1600 ELO.
+
+If your model beats random consistently → it has learned something real.
+If it beats Stockfish depth 1        → you're in 800 ELO territory.
+"""
+
+import os
+import sys
+import random
+import chess
+import chess.engine
+import torch
+from chess_game import ChessGame
+from mcts import MCTS
+from network import ChessNet, device
+
+
+def load_model(checkpoint_path, num_simulations=200):
+    net = ChessNet().to(device)
+    if os.path.exists(checkpoint_path):
+        data = torch.load(checkpoint_path, map_location=device)
+        state = data["model_state_dict"] if isinstance(data, dict) and "model_state_dict" in data else data
+        net.load_state_dict(state)
+        print(f"Loaded checkpoint: {checkpoint_path}")
+    else:
+        print("No checkpoint found — evaluating untrained model.")
+    net.eval()
+    return net
+
+
+def model_move(mcts, game):
+    root = mcts.search(game)
+    visit_counts = {
+        m: root.children[m].visit_count if m in root.children else 0
+        for m in game.get_valid_moves()
+    }
+    return max(visit_counts, key=visit_counts.get)
+
+
+def random_move(game):
+    return random.choice(game.get_valid_moves())
+
+
+def play_one_game(net, num_simulations, model_is_white):
+    """
+    Returns 1  if model wins
+            -1 if model loses
+             0 for draw / unfinished
+    """
+    game = ChessGame()
+    mcts = MCTS(net, num_simulations=num_simulations)
+    move_count = 0
+    max_moves = 150
+
+    while not game.is_terminal() and move_count < max_moves:
+        model_turn = (game.board.turn == chess.WHITE) == model_is_white
+        if model_turn:
+            move = model_move(mcts, game)
+        else:
+            move = random_move(game)
+        game.make_move(move)
+        move_count += 1
+
+    winner = game.check_winner()
+    model_color = 1 if model_is_white else -1
+    if winner == model_color:
+        return 1
+    elif winner == -model_color:
+        return -1
+    return 0
+
+
+def vs_random(net, num_simulations, num_games=20):
+    print(f"\n--- Model vs Random Mover ({num_games} games, {num_simulations} sims) ---")
+    wins = losses = draws = 0
+    for i in range(num_games):
+        model_is_white = (i % 2 == 0)   # alternate colors
+        result = play_one_game(net, num_simulations, model_is_white)
+        if result == 1:
+            wins += 1
+        elif result == -1:
+            losses += 1
+        else:
+            draws += 1
+        print(f"  Game {i+1:2d}: {'WIN' if result==1 else 'LOSS' if result==-1 else 'DRAW'}"
+              f"  (model {'White' if model_is_white else 'Black'})")
+
+    total = wins + losses + draws
+    print(f"\nResult: {wins}W / {losses}L / {draws}D  "
+          f"({100*wins/total:.0f}% wins)")
+    if wins / total >= 0.80:
+        print("  ✓ Strong vs random — model has learned basic chess.")
+    elif wins / total >= 0.50:
+        print("  ~ Inconsistent vs random — still early in training.")
+    else:
+        print("  ✗ Losing to random — model needs more training.")
+
+
+def play_vs_stockfish(net, num_simulations, engine_path, depth, num_games=10):
+    print(f"\n--- Model vs Stockfish depth {depth} ({num_games} games, {num_simulations} sims) ---")
+    try:
+        engine = chess.engine.SimpleEngine.popen_uci(engine_path)
+    except FileNotFoundError:
+        print(f"  Stockfish not found at '{engine_path}'. Skipping.")
+        return
+
+    wins = losses = draws = 0
+    for i in range(num_games):
+        model_is_white = (i % 2 == 0)
+        game = ChessGame()
+        mcts = MCTS(net, num_simulations=num_simulations)
+        move_count = 0
+        max_moves = 150
+
+        while not game.is_terminal() and move_count < max_moves:
+            model_turn = (game.board.turn == chess.WHITE) == model_is_white
+            if model_turn:
+                move = model_move(mcts, game)
+            else:
+                result = engine.play(game.board, chess.engine.Limit(depth=depth))
+                move = result.move
+            game.make_move(move)
+            move_count += 1
+
+        winner = game.check_winner()
+        model_color = 1 if model_is_white else -1
+        if winner == model_color:
+            outcome, wins = "WIN", wins + 1
+        elif winner == -model_color:
+            outcome, losses = "LOSS", losses + 1
+        else:
+            outcome, draws = "DRAW", draws + 1
+
+        print(f"  Game {i+1:2d}: {outcome}"
+              f"  (model {'White' if model_is_white else 'Black'})")
+
+    engine.quit()
+    total = wins + losses + draws
+    print(f"\nResult vs Stockfish depth {depth}: {wins}W / {losses}L / {draws}D  "
+          f"({100*wins/total:.0f}% wins)")
+    if wins / total >= 0.50:
+        print(f"  ✓ Beating Stockfish depth {depth} — solid progress.")
+    else:
+        print(f"  ✗ Not beating Stockfish depth {depth} yet.")
+
+
+def main():
+    checkpoint = "chess_model_checkpoint.pth"
+    try:
+        num_simulations = int(input("Simulations per move for eval (default 200): ") or "200")
+    except ValueError:
+        num_simulations = 200
+
+    net = load_model(checkpoint, num_simulations)
+
+    # Always run random baseline
+    vs_random(net, num_simulations, num_games=20)
+
+    # Stockfish eval — try common locations
+    sf_candidates = [
+        "stockfish",                    # in PATH
+        "stockfish.exe",
+        os.path.join(os.path.dirname(__file__), "stockfish.exe"),
+        os.path.join(os.path.dirname(__file__), "stockfish"),
+    ]
+    sf_path = next((p for p in sf_candidates if os.path.exists(p) or p in ("stockfish", "stockfish.exe")), None)
+
+    run_sf = input("\nRun Stockfish eval? (y/n, requires stockfish in PATH or same folder): ").strip().lower()
+    if run_sf == "y":
+        try:
+            depth = int(input("Stockfish depth (1=~700 ELO, 2=~1100 ELO, 3=~1500 ELO, default 1): ") or "1")
+        except ValueError:
+            depth = 1
+        play_vs_stockfish(net, num_simulations, sf_path or "stockfish", depth, num_games=10)
+
+
+if __name__ == "__main__":
+    main()
