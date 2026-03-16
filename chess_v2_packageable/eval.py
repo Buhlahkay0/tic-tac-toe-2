@@ -48,10 +48,12 @@ def model_move(mcts, game):
     return max(visit_counts, key=visit_counts.get)
 
 
-def random_move(game):
+def random_move(game, prevent_draw=True):
     moves = game.get_valid_moves()
-    non_draw = [m for m in moves if not _would_draw(game, m)]
-    return random.choice(non_draw if non_draw else moves)
+    if prevent_draw:
+        non_draw = [m for m in moves if not _would_draw(game, m)]
+        return random.choice(non_draw if non_draw else moves)
+    return random.choice(moves)
 
 
 def _would_draw(game, move):
@@ -60,7 +62,7 @@ def _would_draw(game, move):
     return test.board.can_claim_draw()
 
 
-def play_one_game(net, num_simulations, model_is_white):
+def play_one_game(net, num_simulations, model_is_white, prevent_draw=True):
     """
     Returns (result, final_fen) where result is 1 (win), -1 (loss), or 0 (draw).
     """
@@ -70,13 +72,13 @@ def play_one_game(net, num_simulations, model_is_white):
     max_moves = 150
 
     while not game.is_terminal() and move_count < max_moves:
-        if game.board.can_claim_draw():
+        if prevent_draw and game.board.can_claim_draw():
             break
         model_turn = (game.board.turn == chess.WHITE) == model_is_white
         if model_turn:
             move = model_move(mcts, game)
         else:
-            move = random_move(game)
+            move = random_move(game, prevent_draw=prevent_draw)
         game.make_move(move)
         move_count += 1
 
@@ -89,13 +91,13 @@ def play_one_game(net, num_simulations, model_is_white):
     return 0, game.board.fen()
 
 
-def vs_random(net, num_simulations, num_games=20):
+def vs_random(net, num_simulations, num_games=20, prevent_draw=True):
     print(f"\n--- Model vs Random Mover ({num_games} games, {num_simulations} sims) ---")
     wins = losses = draws = 0
     final_fen = None
     for i in range(num_games):
         model_is_white = (i % 2 == 0)   # alternate colors
-        result, fen = play_one_game(net, num_simulations, model_is_white)
+        result, fen = play_one_game(net, num_simulations, model_is_white, prevent_draw=prevent_draw)
         final_fen = fen
         if result == 1:
             wins += 1
@@ -118,7 +120,7 @@ def vs_random(net, num_simulations, num_games=20):
         print("  ✗ Losing to random — model needs more training.")
 
 
-def play_vs_stockfish(net, num_simulations, engine_path, depth, num_games=10):
+def play_vs_stockfish(net, num_simulations, engine_path, depth, num_games=10, prevent_draw=True):
     print(f"\n--- Model vs Stockfish depth {depth} ({num_games} games, {num_simulations} sims) ---")
     try:
         engine = chess.engine.SimpleEngine.popen_uci(engine_path)
@@ -135,6 +137,8 @@ def play_vs_stockfish(net, num_simulations, engine_path, depth, num_games=10):
         max_moves = 150
 
         while not game.is_terminal() and move_count < max_moves:
+            if prevent_draw and game.board.can_claim_draw():
+                break
             model_turn = (game.board.turn == chess.WHITE) == model_is_white
             if model_turn:
                 move = model_move(mcts, game)
@@ -179,10 +183,12 @@ def main():
     except ValueError:
         num_games = 20
 
+    prevent_draw = input("Prevent draw by repetition? (y/n, default y): ").strip().lower() != "n"
+
     net = load_model(checkpoint, num_simulations)
 
     # Always run random baseline
-    vs_random(net, num_simulations, num_games=num_games)
+    vs_random(net, num_simulations, num_games=num_games, prevent_draw=prevent_draw)
 
     # Stockfish eval — try common locations
     sf_candidates = [
@@ -203,7 +209,7 @@ def main():
             sf_games = int(input("Number of games vs Stockfish (default 10): ") or "10")
         except ValueError:
             sf_games = 10
-        play_vs_stockfish(net, num_simulations, sf_path or "stockfish", depth, num_games=sf_games)
+        play_vs_stockfish(net, num_simulations, sf_path or "stockfish", depth, num_games=sf_games, prevent_draw=prevent_draw)
 
 
 if __name__ == "__main__":
