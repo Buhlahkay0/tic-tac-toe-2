@@ -1,13 +1,20 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import chess
-import numpy as np
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+from encoding import PLANES, OUTPUT_DIM
+
+
+def _pick_device():
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+device = _pick_device()
 print("Using device:", device)
-
-OUTPUT_DIM = 4672
 
 
 class ResBlock(nn.Module):
@@ -26,15 +33,17 @@ class ResBlock(nn.Module):
 
 
 class ChessNet(nn.Module):
-    def __init__(self, num_res_blocks=5, channels=256, output_dim=OUTPUT_DIM):
+    def __init__(self, channels=128, blocks=8, output_dim=OUTPUT_DIM):
         super().__init__()
+        self.channels = channels
+        self.blocks = blocks
         self.input_block = nn.Sequential(
-            nn.Conv2d(12, channels, 3, padding=1, bias=False),
+            nn.Conv2d(PLANES, channels, 3, padding=1, bias=False),
             nn.BatchNorm2d(channels),
             nn.ReLU(),
         )
         self.res_blocks = nn.Sequential(
-            *[ResBlock(channels) for _ in range(num_res_blocks)]
+            *[ResBlock(channels) for _ in range(blocks)]
         )
         # Policy head: 2-filter conv → flatten → linear
         self.policy_head = nn.Sequential(
@@ -64,50 +73,18 @@ class ChessNet(nn.Module):
         return policy, value
 
 
-_WHITE_CH = {chess.PAWN: 0, chess.KNIGHT: 1, chess.BISHOP: 2,
-             chess.ROOK: 3, chess.QUEEN:  4, chess.KING:   5}
-_BLACK_CH = {chess.PAWN: 6, chess.KNIGHT: 7, chess.BISHOP: 8,
-             chess.ROOK: 9, chess.QUEEN: 10, chess.KING:  11}
-
-
-def board_to_tensor(chess_board, device=device):
-    """
-    Convert a python-chess Board into a 12x8x8 tensor on the specified device.
-
-    Channels:
-      0: White Pawn,   1: White Knight,  2: White Bishop,
-      3: White Rook,   4: White Queen,   5: White King,
-      6: Black Pawn,   7: Black Knight,  8: Black Bishop,
-      9: Black Rook,  10: Black Queen,  11: Black King.
-
-    Row 0 corresponds to rank 8.
-    """
-    arr = np.zeros((12, 8, 8), dtype=np.float32)
-    for square, piece in chess_board.piece_map().items():
-        row = 7 - (square // 8)
-        col = square % 8
-        ch = _WHITE_CH[piece.piece_type] if piece.color == chess.WHITE else _BLACK_CH[piece.piece_type]
-        arr[ch, row, col] = 1.0
-    return torch.from_numpy(arr).unsqueeze(0).to(device)
-
-
-def boards_to_batch(boards):
-    """
-    Convert a list of chess.Board objects into a single (N, 12, 8, 8) CPU tensor.
-    Caller does one .to(device) for the whole batch instead of N individual transfers.
-    """
-    arr = np.zeros((len(boards), 12, 8, 8), dtype=np.float32)
-    for i, board in enumerate(boards):
-        for square, piece in board.piece_map().items():
-            row = 7 - (square // 8)
-            col = square % 8
-            ch = _WHITE_CH[piece.piece_type] if piece.color == chess.WHITE else _BLACK_CH[piece.piece_type]
-            arr[i, ch, row, col] = 1.0
-    return torch.from_numpy(arr)
+def load_checkpoint(path, map_location=None):
+    """Load a checkpoint dict and build a ChessNet with the stored architecture."""
+    data = torch.load(path, map_location=map_location or device)
+    channels = data.get("channels", 128)
+    blocks = data.get("blocks", 8)
+    net = ChessNet(channels=channels, blocks=blocks).to(map_location or device)
+    state = data["model_state_dict"] if "model_state_dict" in data else data
+    net.load_state_dict(state)
+    return net, data
 
 
 if __name__ == "__main__":
     net = ChessNet().to(device)
-    print("Network loaded on device:", next(net.parameters()).device)
     total_params = sum(p.numel() for p in net.parameters())
     print(f"Total parameters: {total_params:,}")

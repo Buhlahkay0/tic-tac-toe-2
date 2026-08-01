@@ -1,134 +1,125 @@
+"""
+Training loop: batched-GPU self-play → replay buffer → network updates.
+
+Run with defaults:            python main.py
+See all knobs:                python main.py --help
+Resume happens automatically if the checkpoint file exists.
+"""
+
+import argparse
 import os
 import random
+import time
 from collections import deque
-from concurrent.futures import ProcessPoolExecutor
 
-import chess
 import torch
-import torch.multiprocessing as tmp
-from network import ChessNet, device
-from play_v3 import print_board_with_coords
-from train import _run_self_play, train_network
 
-REPLAY_BUFFER_SIZE      = 10_000
-MIN_BUFFER_FOR_TRAINING = 512
-BATCH_SIZE              = 512
+from network import ChessNet, device
+from selfplay import SelfPlayEngine, SelfPlayConfig
+from train import train_step
+
+CHECKPOINT_DEFAULT = "chess_checkpoint.pth"
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="AlphaZero-style chess training")
+    p.add_argument("--iterations", type=int, default=200)
+    p.add_argument("--games-per-iter", type=int, default=64)
+    p.add_argument("--parallel-games", type=int, default=64,
+                   help="concurrent self-play games = GPU batch size")
+    p.add_argument("--simulations", type=int, default=200)
+    p.add_argument("--max-plies", type=int, default=200)
+    p.add_argument("--temperature-plies", type=int, default=20)
+    p.add_argument("--channels", type=int, default=128)
+    p.add_argument("--blocks", type=int, default=8)
+    p.add_argument("--batch-size", type=int, default=512)
+    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--weight-decay", type=float, default=1e-4)
+    p.add_argument("--buffer-size", type=int, default=150_000)
+    p.add_argument("--min-buffer", type=int, default=5_000,
+                   help="positions required before training starts")
+    p.add_argument("--train-ratio", type=float, default=1.0,
+                   help="training samples consumed per new self-play position")
+    p.add_argument("--checkpoint", default=CHECKPOINT_DEFAULT)
+    p.add_argument("--checkpoint-every", type=int, default=5)
+    return p.parse_args()
 
 
 def main():
-    net       = ChessNet().to(device)
-    optimizer = torch.optim.Adam(net.parameters(), lr=0.001)
-    scaler    = torch.amp.GradScaler("cuda") if device.type == "cuda" else None
+    args = parse_args()
 
-    checkpoint = "chess_model_checkpoint.pth"
-    if os.path.exists(checkpoint):
-        checkpoint_data = torch.load(checkpoint, map_location=device)
-        if isinstance(checkpoint_data, dict) and "model_state_dict" in checkpoint_data:
-            net.load_state_dict(checkpoint_data["model_state_dict"])
-            optimizer.load_state_dict(checkpoint_data["optimizer_state_dict"])
-            print("Loaded checkpoint with model and optimizer state.")
-        else:
-            net.load_state_dict(checkpoint_data)
-            print("Loaded old checkpoint with model weights only.")
+    net = ChessNet(channels=args.channels, blocks=args.blocks).to(device)
+    optimizer = torch.optim.AdamW(net.parameters(), lr=args.lr,
+                                  weight_decay=args.weight_decay)
+    scaler = torch.amp.GradScaler("cuda") if device.type == "cuda" else None
+    start_iteration = 0
+
+    if os.path.exists(args.checkpoint):
+        data = torch.load(args.checkpoint, map_location=device)
+        if data.get("channels", args.channels) != args.channels or \
+           data.get("blocks", args.blocks) != args.blocks:
+            raise SystemExit(
+                f"Checkpoint {args.checkpoint} was trained with "
+                f"{data.get('channels')}x{data.get('blocks')}, but you asked for "
+                f"{args.channels}x{args.blocks}. Pass matching --channels/--blocks "
+                f"or move the checkpoint aside to start fresh."
+            )
+        net.load_state_dict(data["model_state_dict"])
+        optimizer.load_state_dict(data["optimizer_state_dict"])
+        start_iteration = data.get("iteration", 0)
+        print(f"Resumed from {args.checkpoint} at iteration {start_iteration}.")
     else:
         print("No checkpoint found. Starting from scratch.")
 
+    config = SelfPlayConfig(
+        num_simulations=args.simulations,
+        parallel_games=args.parallel_games,
+        temperature_plies=args.temperature_plies,
+        max_game_plies=args.max_plies,
+    )
+    engine = SelfPlayEngine(net, device, config)
+    buffer = deque(maxlen=args.buffer_size)
 
-    try:
-        num_iterations = int(input("Enter the number of iterations (default 200): ") or "200")
-    except ValueError:
-        print("Invalid input. Defaulting to 200 iterations.")
-        num_iterations = 200
+    for iteration in range(start_iteration, args.iterations):
+        t0 = time.time()
+        print(f"\nIteration {iteration + 1}/{args.iterations}")
 
-    try:
-        num_simulations = int(input("Enter the number of simulations for self-play (default 200): ") or "200")
-    except ValueError:
-        print("Invalid input. Defaulting to 200 simulations.")
-        num_simulations = 200
+        examples, stats = engine.play(args.games_per_iter)
+        buffer.extend(examples)
 
-    try:
-        checkpoint_freq = int(input("Enter checkpoint save frequency (default 10): ") or "10")
-    except ValueError:
-        print("Invalid input. Defaulting to checkpoint saving every 10 iterations.")
-        checkpoint_freq = 10
+        avg_plies = stats["plies"] / max(1, stats["games"])
+        print(f"  games: {stats['games']} "
+              f"(W {stats['white']} / D {stats['draw']} / B {stats['black']}) | "
+              f"checkmates {stats['by_checkmate']}, adjudicated {stats['by_adjudication']}, "
+              f"repetition {stats['by_repetition']}, fifty-move {stats['by_fifty_move']}")
+        print(f"  avg plies: {avg_plies:.0f} | new positions: {len(examples)} | "
+              f"buffer: {len(buffer)}")
 
-    try:
-        max_moves = int(input("Enter the maximum moves per game (default 150): ") or "150")
-    except ValueError:
-        print("Invalid input. Defaulting to 150 moves.")
-        max_moves = 150
+        if len(buffer) >= args.min_buffer:
+            pool = list(buffer)
+            steps = max(1, round(len(examples) * args.train_ratio / args.batch_size))
+            policy_losses, value_losses = [], []
+            for _ in range(steps):
+                batch = random.sample(pool, min(args.batch_size, len(pool)))
+                pl, vl = train_step(net, optimizer, batch, device, scaler)
+                policy_losses.append(pl)
+                value_losses.append(vl)
+            print(f"  trained {steps} steps | policy loss {sum(policy_losses)/steps:.4f} | "
+                  f"value loss {sum(value_losses)/steps:.4f}")
+        else:
+            print(f"  buffer filling... {len(buffer)}/{args.min_buffer} before training starts")
 
-    try:
-        eval_batch_size = int(input("Enter MCTS eval batch size (default 16): ") or "16")
-    except ValueError:
-        print("Invalid input. Defaulting to 16.")
-        eval_batch_size = 16
+        print(f"  iteration time: {time.time() - t0:.0f}s")
 
-    cpu_count = os.cpu_count() or 4
-    default_workers = max(1, cpu_count - 1)
-    try:
-        num_workers = int(input(f"Enter number of parallel self-play workers (default {default_workers}, max {cpu_count - 1}): ") or str(default_workers))
-        num_workers = max(1, min(num_workers, cpu_count - 1))
-    except ValueError:
-        print(f"Invalid input. Defaulting to {default_workers} workers.")
-        num_workers = default_workers
-
-    print(f"Running {num_workers} self-play workers on CPU, training on {device}.")
-
-    replay_buffer = deque(maxlen=REPLAY_BUFFER_SIZE)
-    white_wins = black_wins = draw_count = 0
-
-    # spawn context required on Windows for CUDA safety in subprocesses
-    mp_ctx = tmp.get_context("spawn")
-
-    with ProcessPoolExecutor(max_workers=num_workers, mp_context=mp_ctx) as pool:
-        for iteration in range(num_iterations):
-            print(f"\nIteration {iteration+1}/{num_iterations}")
-
-            cpu_weights = {k: v.cpu() for k, v in net.state_dict().items()}
-            worker_args = [(cpu_weights, num_simulations, max_moves, eval_batch_size)] * num_workers
-
-            # All workers run in parallel; we block until all finish
-            game_results = list(pool.map(_run_self_play, worker_args))
-
-            final_fen = None
-            for states, mcts_probs, rewards, players, winner, game_fen in game_results:
-                if winner == 1:
-                    white_wins += 1
-                elif winner == -1:
-                    black_wins += 1
-                else:
-                    draw_count += 1
-                replay_buffer.extend(zip(states, mcts_probs, rewards, players))
-                final_fen = game_fen
-
-            print(f"  Stats — White: {white_wins}, Black: {black_wins}, Draws: {draw_count}")
-
-            if final_fen:
-                print_board_with_coords(chess.Board(final_fen), human_is_white=True)
-
-            if len(replay_buffer) >= MIN_BUFFER_FOR_TRAINING:
-                batch_size = min(BATCH_SIZE, len(replay_buffer))
-                batch      = random.sample(replay_buffer, batch_size)
-                b_states, b_probs, b_rewards, b_players = zip(*batch)
-                train_network(
-                    net, optimizer,
-                    list(b_states), list(b_probs), list(b_rewards), list(b_players),
-                    epochs=1, scaler=scaler,
-                )
-            else:
-                remaining = MIN_BUFFER_FOR_TRAINING - len(replay_buffer)
-                print(
-                    f"  Buffer filling... {len(replay_buffer)}/{MIN_BUFFER_FOR_TRAINING} "
-                    f"({remaining} more needed before training starts)"
-                )
-
-            if (iteration + 1) % checkpoint_freq == 0 or (iteration + 1) == num_iterations:
-                torch.save(
-                    {'model_state_dict': net.state_dict(), 'optimizer_state_dict': optimizer.state_dict()},
-                    checkpoint,
-                )
-                print(f"Checkpoint saved at iteration {iteration+1}")
+        if (iteration + 1) % args.checkpoint_every == 0 or (iteration + 1) == args.iterations:
+            torch.save({
+                "model_state_dict": net.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "channels": args.channels,
+                "blocks": args.blocks,
+                "iteration": iteration + 1,
+            }, args.checkpoint)
+            print(f"  checkpoint saved: {args.checkpoint}")
 
 
 if __name__ == "__main__":
